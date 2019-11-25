@@ -1,0 +1,15 @@
+version: 0.2
+phases:
+  install:
+    runtime-versions:
+        nodejs: 10
+
+    # cd into application directory and install any dependencies
+    commands:
+      - cd application
+      - npm install
+  
+  # run those tests!
+  build:
+    commands:
+      - npm test

@@ -1,0 +1,23 @@
+version: 0.2
+phases:
+  install:
+    runtime-versions:
+        nodejs: 10
+
+    # Install production dependencies
+    commands:
+      - cd application
+      - npm install --production
+      - cd ..
+
+  # Build configuration and templates used to create a CloudFormation changeset
+  build:
+    commands:
+      - make out/config.application.json
+      - make aws_profile= out/application.output.yaml
+      
+artifacts:
+  base-directory: out
+  files:
+    - application.output.yaml
+    - config.application.json

@@ -1,0 +1,387 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: CI/CD and app delivery
+
+Parameters:
+  BootstrapStackName:
+    Type: String
+  ChangeSetName:
+    Type: String
+  Environment:
+    Type: String
+    AllowedValues:
+      - sandbox
+    Default: sandbox
+  GitHubOwner:
+    Type: String
+    Description: Repo owner for GitHub repository attached to source action
+  GitHubRepo:
+    Type: String
+    Description: Repo name for GitHub repository attached to source action
+  GitHubBranch:
+    Type: String
+    Description: Repo branch for GitHub repository attached to source action
+  GitHubDevelopBranch:
+    Type: String
+    Description: Repo branch where development takes place
+  GitHubToken:
+    Type: String
+    Description: A GitHub token used to authorize GitHub actions
+    NoEcho: true
+  StackName:
+    Type: String
+    Description: The name of the stack to deploy to
+
+Resources:
+  PipelineWebhook:
+    Type: AWS::CodePipeline::Webhook
+    Properties:
+      AuthenticationConfiguration:
+        SecretToken: !Ref GitHubToken
+      Filters:
+        - JsonPath: "$.ref"
+          MatchEquals: refs/heads/{Branch}
+      Authentication: GITHUB_HMAC
+      TargetPipeline: !Ref Pipeline
+      TargetAction: Source
+      TargetPipelineVersion: !GetAtt Pipeline.Version
+      RegisterWithThirdParty: 'true'
+  
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RestartExecutionOnUpdate: true
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location:
+          Fn::ImportValue:
+            !Sub ${BootstrapStackName}-OutputBucket
+      Stages:
+        -
+          Name: Source
+          Actions:
+            -
+              Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Provider: GitHub
+                Version: 1
+              Configuration:
+                Owner: !Ref GitHubOwner
+                Repo: !Ref GitHubRepo
+                Branch: !Ref GitHubBranch
+                OAuthToken: !Ref GitHubToken
+                PollForSourceChanges: false
+              OutputArtifacts:
+                - Name: SourceOutput
+        -
+          Name: Build
+          Actions:
+            -
+              Name: BuildTemplate
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: 1
+              Configuration:
+                ProjectName: !Ref Build
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 1
+        -
+          Name: Deploy
+          Actions:
+            -
+              Name: Deploy
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: 1
+              Configuration:
+                ActionMode: CHANGE_SET_REPLACE
+                ChangeSetName: !Ref ChangeSetName
+                RoleArn: !GetAtt CloudFormationRole.Arn
+                TemplatePath: BuildOutput::application.output.yaml
+                TemplateConfiguration: BuildOutput::config.application.json
+                Capabilities: CAPABILITY_IAM
+                StackName: !Ref StackName
+              InputArtifacts:
+                - Name: BuildOutput
+                - Name: SourceOutput
+              RunOrder: 1
+            -
+              Name: ExecuteChangeset
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: 1
+              Configuration:
+                ActionMode: CHANGE_SET_EXECUTE
+                ChangeSetName: !Ref ChangeSetName
+                StackName: !Ref StackName
+              InputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 2
+
+  Build:
+    Type: AWS::CodeBuild::Project
+    Description: "Code build project for application builds"
+    Properties:
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: infrastructure/src/buildspecs/buildspec.application.yaml
+      Artifacts:
+        Type: CODEPIPELINE
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Environment:
+        Type: LINUX_CONTAINER
+        Image: aws/codebuild/standard:2.0
+        ComputeType: BUILD_GENERAL1_SMALL
+
+  TestBuild:
+    Type: AWS::CodeBuild::Project
+    Description: "Code build project for running automated tests on Fanout"
+    Properties:
+      Source:
+        Type: GITHUB
+        BuildSpec: infrastructure/src/buildspecs/buildspec.test.yaml
+        Location: !Sub https://github.com/${GitHubOwner}/${GitHubRepo}.git
+        ReportBuildStatus: true
+      SourceVersion: !Ref GitHubDevelopBranch
+      Artifacts:
+        Type: NO_ARTIFACTS
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Environment:
+        Type: LINUX_CONTAINER
+        Image: aws/codebuild/standard:2.0
+        ComputeType: BUILD_GENERAL1_SMALL
+      Triggers:
+        Webhook: true
+        FilterGroups:
+          - - Type: EVENT
+              Pattern: PULL_REQUEST_CREATED,PULL_REQUEST_UPDATED,PULL_REQUEST_REOPENED
+            - Type: BASE_REF
+              Pattern: "^refs/heads/(develop)$"
+
+  SourceCredentials:
+    Type: AWS::CodeBuild::SourceCredential
+    Properties: 
+      AuthType: PERSONAL_ACCESS_TOKEN
+      ServerType: GITHUB
+      Token: !Ref GitHubToken
+
+  CodeBuildPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: "Managed policy for building and deploying via CodeBuild"
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - cloudformation:ValidateTemplate
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - ecr:BatchCheckLayerAvailability
+              - ecr:GetDownloadUrlForLayer
+              - ecr:BatchGetImage
+              - ecr:GetAuthorizationToken
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - s3:*
+            Resource:
+              - !Sub 
+                - "arn:aws:s3:::${Bucket}/*"
+                - Bucket:
+                    Fn::ImportValue:
+                      !Sub "${BootstrapStackName}-BuildBucket"
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - Ref: CodeBuildPolicy
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - sts:AssumeRole
+            Principal:
+              Service:
+                - codebuild.amazonaws.com
+
+  CloudFormationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSLambdaExecute
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - sts:AssumeRole
+            Principal:
+              Service:
+                - cloudformation.amazonaws.com
+      Policies:
+        - 
+         PolicyName: "CloudFormationPolicy"
+         PolicyDocument:
+           Version: "2012-10-17"
+           Statement:
+              - 
+                Effect: "Allow"
+                Sid: "GenericCloudFormationStatement"
+                Action:
+                  - "iam:GetRole"
+                  - "iam:CreateRole"
+                  - "iam:DeleteRole"
+                  - "iam:AttachRolePolicy"
+                  - "iam:PutRolePolicy"
+                  - "s3:GetBucketVersioning"
+                  - "cloudformation:CreateChangeSet"
+                  - "iam:PassRole"
+                  - "iam:DetachRolePolicy"
+                  - "iam:DeleteRolePolicy"
+                  - "codedeploy:*"
+                  - "s3:GetObjectVersion"
+                Resource: "*"
+              -
+                Effect: "Allow"
+                Sid: "ApplicationPolicyStatement"
+                Action:
+                  - "lambda:*"
+                  - "ec2:DescribeSecurityGroups"
+                  - "ec2:DescribeSubnets"
+                  - "ec2:DescribeVpcs"
+                Resource: "*"
+
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - sts:AssumeRole
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+      Policies:
+        - PolicyName: "CodePipelinePolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Action:
+                  - iam:PassRole
+                Resource: "*"
+                Effect: Allow
+                Condition:
+                  StringEqualsIfExists:
+                    iam:PassedToService:
+                      - cloudformation.amazonaws.com
+                      - elasticbeanstalk.amazonaws.com
+                      - ec2.amazonaws.com
+                      - ecs-tasks.amazonaws.com
+              - Action:
+                  - codecommit:CancelUploadArchive
+                  - codecommit:GetBranch
+                  - codecommit:GetCommit
+                  - codecommit:GetUploadArchiveStatus
+                  - codecommit:UploadArchive
+                Resource: "*"
+                Effect: Allow
+              - Action:
+                  - codedeploy:CreateDeployment
+                  - codedeploy:GetApplication
+                  - codedeploy:GetApplicationRevision
+                  - codedeploy:GetDeployment
+                  - codedeploy:GetDeploymentConfig
+                  - codedeploy:RegisterApplicationRevision
+                Resource: "*"
+                Effect: Allow
+              - Action:
+                  - elasticbeanstalk:*
+                  - ec2:*
+                  - elasticloadbalancing:*
+                  - autoscaling:*
+                  - cloudwatch:*
+                  - s3:*
+                  - sns:*
+                  - cloudformation:*
+                  - rds:*
+                  - sqs:*
+                  - ecs:*
+                Resource: "*"
+                Effect: Allow
+              - Action:
+                  - lambda:InvokeFunction
+                  - lambda:ListFunctions
+                Resource: "*"
+                Effect: Allow
+              - Action:
+                  - opsworks:CreateDeployment
+                  - opsworks:DescribeApps
+                  - opsworks:DescribeCommands
+                  - opsworks:DescribeDeployments
+                  - opsworks:DescribeInstances
+                  - opsworks:DescribeStacks
+                  - opsworks:UpdateApp
+                  - opsworks:UpdateStack
+                Resource: "*"
+                Effect: Allow
+              - Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:UpdateStack
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:SetStackPolicy
+                  - cloudformation:ValidateTemplate
+                Resource: "*"
+                Effect: Allow
+              - Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                Resource: "*"
+                Effect: Allow
+              - Effect: Allow
+                Action:
+                  - devicefarm:ListProjects
+                  - devicefarm:ListDevicePools
+                  - devicefarm:GetRun
+                  - devicefarm:GetUpload
+                  - devicefarm:CreateUpload
+                  - devicefarm:ScheduleRun
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - servicecatalog:ListProvisioningArtifacts
+                  - servicecatalog:CreateProvisioningArtifact
+                  - servicecatalog:DescribeProvisioningArtifact
+                  - servicecatalog:DeleteProvisioningArtifact
+                  - servicecatalog:UpdateProduct
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - cloudformation:ValidateTemplate
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecr:DescribeImages
+                Resource: "*"
