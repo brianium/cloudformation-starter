@@ -11,6 +11,15 @@ K := $(foreach exec,$(EXECUTABLES),\
         $(if $(shell which $(exec)),some string,$(error "Executable $(exec) required")))
 
 #############################################
+# Global configuration
+#
+# This is configuration that is globally
+# shared and should make sense in any context
+#############################################
+
+application_name ?= myapp
+
+#############################################
 # AWS Configuration
 #
 # Configure region, profile, and AWS environment
@@ -24,7 +33,7 @@ aws_region ?= us-east-2
 aws_profile ?= default
 aws_account_id ?= 123456789101112
 aws_build_bucket ?= build-iehib5fu
-stack_prefix ?= myapp
+stack_prefix ?= $(application_name)
 
 export AWS_DEFAULT_REGION := $(aws_region)
 

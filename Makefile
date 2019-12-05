@@ -1,12 +1,21 @@
 include config.mk
 
 .PHONY: all
+all: environment=production
 all: clean bootstrap application automation
 
 .PHONY: application
-application: out/application.output.yaml validate-application
+application_dependencies := out/application.output.yaml validate-application
+application: stack_prefix=$(application_name)-$(environment)
+application: $(application_dependencies)
 	$(deploy) --parameter-overrides \
 	Environment=$(environment)
+
+.PHONY: create-change-set/application
+create-change-set/application: stack_prefix=$(application_name)-$(environment)
+create-change-set/application: $(application_dependencies)
+	$(call create-change-set,application) \
+	--parameters ParameterKey="Environment",ParameterValue="$(environment)" 
 
 .PHONY: automation
 automation: out/automation.output.yaml validate-automation
