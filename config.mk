@@ -65,6 +65,8 @@ github_develop_branch ?= develop
 github_token_parameter ?= /path/to/github_token
 github_token ?= $(shell $(AWS) ssm get-parameter --with-decryption --name $(github_token_parameter) | jq -r ".Parameter | .Value")
 version_type ?= patch
+version ?= 0.0.0 # This can tracked any way that makes sense for the project i.e $(shell cat version.txt)
+version_title ?= $(subst .,-,$(version))
 
 #############################################
 # Macros and Functions
@@ -86,4 +88,18 @@ define deploy
 	--stack-name $(stack_prefix)-$@ \
 	--template-file out/$@.output.yaml \
 	--capabilities CAPABILITY_IAM
+endef
+
+###
+# Create a change set against a stack
+#
+# Args:
+# $(1) - The name of the target to create a change set against, i.e "application"
+###
+define create-change-set
+	$(AWS) cloudformation create-change-set \
+	--stack-name $(stack_prefix)-$(1) \
+	--template-body file://out/$(1).output.yaml \
+	--change-set-name $(stack_prefix)-$(1)-$(version_title) \
+	--capabilities CAPABILITY_IAM CAPABILITY_AUTO_EXPAND
 endef
